@@ -86,10 +86,36 @@ async def run_analysis_agent(top_deals_file: str) -> str:
 
     print(f"  Analyzing {len(deals)} vehicles with AI vision...\n")
 
-    # Build the vehicle summary for the orchestrator
-    vehicles_summary = ""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_file = os.path.join(WORK_DIR, "data", f"deal_report_{timestamp}.md")
+
+    # Pre-download all vehicle photos for vision analysis
+    images_dir = os.path.join(WORK_DIR, "data", "images")
+    os.makedirs(images_dir, exist_ok=True)
+    print("  Downloading vehicle photos for AI vision analysis...")
     for i, d in enumerate(deals, 1):
-        vehicles_summary += f"""
+        if d.get("image_url"):
+            img_path = os.path.join(images_dir, f"vehicle_{d['lot_number']}.jpg")
+            if not os.path.exists(img_path):
+                try:
+                    import httpx
+                    with httpx.Client(follow_redirects=True) as img_client:
+                        resp = img_client.get(d["image_url"], timeout=15)
+                        if resp.status_code == 200:
+                            with open(img_path, "wb") as img_f:
+                                img_f.write(resp.content)
+                            print(f"    [{i}/{len(deals)}] Downloaded: {d['title']}")
+                        else:
+                            print(f"    [{i}/{len(deals)}] Failed ({resp.status_code}): {d['title']}")
+                except Exception as e:
+                    print(f"    [{i}/{len(deals)}] Error: {e}")
+
+    # Add local image paths to the vehicle summary
+    vehicles_summary_with_images = ""
+    for i, d in enumerate(deals, 1):
+        img_path = os.path.join(images_dir, f"vehicle_{d['lot_number']}.jpg")
+        has_image = os.path.exists(img_path)
+        vehicles_summary_with_images += f"""
 --- Vehicle #{i} ---
 Title: {d['title']}
 Lot: {d['lot_number']} | VIN: {d['vin']}
@@ -100,29 +126,26 @@ Condition: {d['condition']} | Odometer: {d['odometer']} ({d['odometer_status']})
 Color: {d['color']} | Engine: {d['engine']} | Trans: {d['transmission']} | Drive: {d['drive']}
 Title Type: {d['title_type']} | Title Group: {d['title_group']}
 Location: {d['location']} ({d['state']}) | Sale: {d['sale_date']} [{d['sale_status']}]
-Photo URL: {d['image_url']}
+Local Photo: {img_path if has_image else 'NOT AVAILABLE'}
 Copart URL: {d['url']}
 """
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_file = os.path.join(WORK_DIR, "data", f"deal_report_{timestamp}.md")
-
     prompt = f"""You are the Copart Deal Analysis Orchestrator. Your job is to analyze vehicle deals from Copart auctions and produce an investment-quality report.
 
-You have {len(deals)} vehicles to analyze. For each vehicle:
+You have {len(deals)} vehicles to analyze. Vehicle photos have been pre-downloaded locally. For each vehicle:
 
-1. **Photo Analysis**: Use the "photo-analyzer" agent to analyze each vehicle's photo. Pass it the photo URL and vehicle details. The agent will assess visible damage, overall condition, and red flags from the image.
+1. **Photo Analysis**: Use the "photo-analyzer" agent to analyze each vehicle's photo. Pass it the LOCAL photo file path and vehicle details. The agent will use the Read tool to visually inspect the image and assess visible damage, overall condition, and red flags.
 
 2. **Deal Evaluation**: Use the "deal-evaluator" agent for each vehicle. Pass it ALL the data (specs + photo analysis results). It will produce a final investment score and recommendation.
 
 3. **Final Report**: After all vehicles are analyzed, compile a comprehensive markdown report ranking all deals from best to worst.
 
 Here are the vehicles to analyze:
-{vehicles_summary}
+{vehicles_summary_with_images}
 
 IMPORTANT INSTRUCTIONS:
 - Analyze ALL {len(deals)} vehicles, not just a few
-- For each vehicle, first spawn the photo-analyzer agent, then the deal-evaluator agent with the photo analysis results
+- For each vehicle, first spawn the photo-analyzer agent with the LOCAL photo path (not URL), then the deal-evaluator agent with the photo analysis results
 - The final report must include for each vehicle:
   * Investment score (1-100)
   * Photo analysis summary
@@ -140,33 +163,35 @@ IMPORTANT INSTRUCTIONS:
         options=ClaudeAgentOptions(
             cwd=WORK_DIR,
             model="claude-sonnet-4-6",
-            allowed_tools=["Read", "Write", "Glob", "Grep", "WebFetch", "Agent", "Bash"],
+            allowed_tools=["Read", "Write", "Glob", "Grep", "Agent", "Bash"],
             permission_mode="bypassPermissions",
             allow_dangerously_skip_permissions=True,
             max_turns=100,
             env={"CLAUDECODE": ""},
             agents={
                 "photo-analyzer": AgentDefinition(
-                    description="Expert vehicle photo analyst. Analyzes Copart vehicle photos to assess damage severity, hidden issues, and overall condition.",
-                    prompt="""You are an expert vehicle damage assessor and automotive photographer analyst.
+                    description="Expert vehicle photo analyst. Uses Claude vision to analyze Copart vehicle photos and assess damage severity, hidden issues, and overall condition.",
+                    prompt="""You are an expert vehicle damage assessor and automotive photographer analyst with Claude's vision capabilities.
 
-When given a vehicle photo URL and details, you must:
-1. Use WebFetch to retrieve and analyze the vehicle photo
-2. Assess the visible damage from the photo:
-   - Is the listed damage consistent with what you see?
+When given a vehicle's LOCAL photo file path and details, you must:
+1. Use the Read tool on the local image file path (e.g. data/images/vehicle_12345.jpg). The Read tool supports image files — it will display the photo so you can visually inspect it.
+2. Carefully examine the image and assess the visible damage:
+   - Is the listed damage consistent with what you see in the photo?
    - Severity: Minor (cosmetic only), Moderate (panel replacement), Severe (structural)
    - Are there signs of hidden damage not listed? (frame damage, flood, airbag deployment)
-3. Evaluate overall condition:
+   - Look for deployed airbags, broken glass, fluid leaks, or frame distortion
+3. Evaluate overall condition from the photo:
    - Body alignment (gaps between panels)
-   - Paint condition
+   - Paint condition (fading, peeling, mismatched panels)
    - Tire condition (if visible)
-   - Glass condition
+   - Glass condition (cracks, missing windows)
    - Rust or corrosion
+   - Interior condition (if visible)
 4. Provide a photo condition score (1-10, where 10 = excellent)
-5. List specific observations and red flags
+5. List specific observations and red flags based on what you ACTUALLY SEE in the image
 
-Respond with a structured analysis. Be specific about what you observe.""",
-                    tools=["WebFetch", "Read"],
+IMPORTANT: Always use the Read tool to view the image file first. Do NOT guess or make assumptions without looking at the photo. Be specific about what you observe in the actual image.""",
+                    tools=["Read"],
                 ),
                 "deal-evaluator": AgentDefinition(
                     description="Expert automotive deal evaluator. Scores vehicle deals based on market value, damage assessment, repair costs, and investment potential.",
@@ -200,7 +225,7 @@ When given vehicle data and photo analysis, evaluate the deal:
 5. **Final Recommendation**: BUY / WATCH / PASS with reasoning
 
 Be realistic and conservative. Actual repair costs are usually 30-50% higher than estimates.""",
-                    tools=["WebFetch", "Read"],
+                    tools=["Read"],
                 ),
             },
         ),
