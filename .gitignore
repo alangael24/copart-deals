@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/
+*.csv
+debug_*.py
+.env
